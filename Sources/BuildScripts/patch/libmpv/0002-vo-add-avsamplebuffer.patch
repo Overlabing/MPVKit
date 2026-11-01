@@ -1,0 +1,501 @@
+diff --git a/meson.build b/meson.build
+index 42ece8e..ca6cbd3 100644
+--- a/meson.build
++++ b/meson.build
+@@ -823,6 +823,14 @@ if features['avfoundation']
+     sources += files('audio/out/ao_avfoundation.m')
+ endif
+ 
++avsamplebuffer_deps = dependency('appleframeworks', modules: ['CoreMedia', 'CoreVideo', 'AVFoundation'],
++                                 required: false)
++features += {'avsamplebuffer': features['avfoundation'] and avsamplebuffer_deps.found()}
++if features['avsamplebuffer']
++    dependencies += avsamplebuffer_deps
++    sources += files('video/out/vo_avsamplebuffer.m')
++endif
++
+ coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
+                        'AudioUnit', 'AudioToolbox'], required: get_option('coreaudio'))
+ features += {'coreaudio': coreaudio.found()}
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..c9fddc4 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -47,6 +47,7 @@
+ #include "osdep/threads.h"
+ 
+ extern const struct vo_driver video_out_mediacodec_embed;
++extern const struct vo_driver video_out_avsamplebuffer;
+ extern const struct vo_driver video_out_x11;
+ extern const struct vo_driver video_out_vdpau;
+ extern const struct vo_driver video_out_xv;
+@@ -88,6 +89,9 @@ static const struct vo_driver *const video_out_drivers[] =
+ #if HAVE_ANDROID
+     &video_out_mediacodec_embed,
+ #endif
++#if HAVE_AVSAMPLEBUFFER
++    &video_out_avsamplebuffer,
++#endif
+ #if HAVE_SDL2_VIDEO
+     &video_out_sdl,
+ #endif
+diff --git a/video/out/vo_avsamplebuffer.m b/video/out/vo_avsamplebuffer.m
+new file mode 100644
+index 0000000..b6bd5f9
+--- /dev/null
++++ b/video/out/vo_avsamplebuffer.m
+@@ -0,0 +1,454 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * vo_avsamplebuffer: present decoded frames through an AVSampleBufferDisplayLayer.
++ *
++ * The layer is provided by the host application and passed as --wid (an
++ * unretained pointer to the AVSampleBufferDisplayLayer, as an integer). Frames
++ * are wrapped in CMSampleBuffers flagged DisplayImmediately and enqueued on the
++ * layer; mpv itself does the pacing (no timebase is used), the system
++ * compositor does the presentation. No GPU rendering happens in mpv.
++ *
++ * Accepted input:
++ *   - IMGFMT_VIDEOTOOLBOX (hwdec=videotoolbox, zero copy: the CVPixelBuffer is
++ *     enqueued directly)
++ *   - IMGFMT_NV12, IMGFMT_P010 (copied into a pooled CVPixelBuffer)
++ *   - IMGFMT_420P, YUV420P10 (converted to NV12 / P010 while copying)
++ *
++ * Not supported in this iteration (video only):
++ *   - OSD and subtitle rendering (nothing is drawn on top of the video; render
++ *     subtitles natively in the app, or keep using another vo for burned-in subs)
++ *   - HDR static/dynamic metadata (mastering display, content light level).
++ *     Only primaries / transfer / matrix attachments are set.
++ *   - video rotation (--video-rotate), flips, crop, panscan, filters needing GPU
++ *   - screenshots
++ *
++ * Memory management: mpv is built without ARC, so everything is manual
++ * retain/release.
++ */
++
++#include <AVFoundation/AVFoundation.h>
++#include <CoreMedia/CoreMedia.h>
++#include <CoreVideo/CoreVideo.h>
++
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_videotoolbox.h>
++#include <libavutil/pixfmt.h>
++
++#include "common/common.h"
++#include "options/m_config.h"
++#include "video/fmt-conversion.h"
++#include "video/hwdec.h"
++#include "video/mp_image.h"
++#include "vo.h"
++
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++struct priv {
++    AVSampleBufferDisplayLayer *layer; // retained
++    struct mp_hwdec_ctx hwctx;
++    bool hwctx_added;
++
++    struct mp_image_params params;
++    CVPixelBufferPoolRef pool;
++    OSType pool_format;
++    int pool_w, pool_h;
++};
++
++static OSType sw_pixel_format(struct priv *p, int imgfmt, bool *ten_bit_planar)
++{
++    bool full = p->params.repr.levels == PL_COLOR_LEVELS_FULL;
++    *ten_bit_planar = false;
++    if (imgfmt == IMGFMT_NV12 || imgfmt == IMGFMT_420P) {
++        return full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++                    : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++    }
++    if (imgfmt == IMGFMT_P010 || imgfmt == pixfmt2imgfmt(AV_PIX_FMT_YUV420P10)) {
++        *ten_bit_planar = imgfmt != IMGFMT_P010;
++        return full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
++                    : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++    }
++    return 0;
++}
++
++static void attach_colorimetry(struct priv *p, CVPixelBufferRef pb)
++{
++    const struct mp_image_params *par = &p->params;
++
++    CFStringRef prim = NULL, trc = NULL, matrix = NULL;
++
++    switch (par->color.primaries) {
++    case PL_COLOR_PRIM_BT_709:
++        prim = kCVImageBufferColorPrimaries_ITU_R_709_2; break;
++    case PL_COLOR_PRIM_BT_2020:
++        prim = kCVImageBufferColorPrimaries_ITU_R_2020; break;
++    case PL_COLOR_PRIM_DCI_P3:
++        prim = kCVImageBufferColorPrimaries_DCI_P3; break;
++    case PL_COLOR_PRIM_DISPLAY_P3:
++        prim = kCVImageBufferColorPrimaries_P3_D65; break;
++    case PL_COLOR_PRIM_BT_601_525:
++        prim = kCVImageBufferColorPrimaries_SMPTE_C; break;
++    case PL_COLOR_PRIM_BT_601_625:
++        prim = kCVImageBufferColorPrimaries_EBU_3213; break;
++    default: break;
++    }
++
++    switch (par->color.transfer) {
++    case PL_COLOR_TRC_PQ:
++        trc = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ; break;
++    case PL_COLOR_TRC_HLG:
++        trc = kCVImageBufferTransferFunction_ITU_R_2100_HLG; break;
++    case PL_COLOR_TRC_SRGB:
++        trc = kCVImageBufferTransferFunction_sRGB; break;
++    case PL_COLOR_TRC_LINEAR:
++        trc = kCVImageBufferTransferFunction_Linear; break;
++    case PL_COLOR_TRC_BT_1886:
++    case PL_COLOR_TRC_GAMMA22:
++    default:
++        // BT.709 transfer is the usual SDR tag; BT.1886 is its display EOTF.
++        trc = kCVImageBufferTransferFunction_ITU_R_709_2; break;
++    }
++
++    switch (par->repr.sys) {
++    case PL_COLOR_SYSTEM_BT_709:
++        matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2; break;
++    case PL_COLOR_SYSTEM_BT_601:
++        matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4; break;
++    case PL_COLOR_SYSTEM_BT_2020_NC:
++    case PL_COLOR_SYSTEM_BT_2020_C:
++        matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020; break;
++    default: break;
++    }
++
++    if (prim)
++        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, prim,
++                              kCVAttachmentMode_ShouldPropagate);
++    if (trc)
++        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, trc,
++                              kCVAttachmentMode_ShouldPropagate);
++    if (matrix)
++        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix,
++                              kCVAttachmentMode_ShouldPropagate);
++
++    if (par->p_w > 0 && par->p_h > 0 && par->p_w != par->p_h) {
++        const void *keys[] = {kCVImageBufferPixelAspectRatioHorizontalSpacingKey,
++                              kCVImageBufferPixelAspectRatioVerticalSpacingKey};
++        int w = par->p_w, h = par->p_h;
++        CFNumberRef vals[2] = {
++            CFNumberCreate(NULL, kCFNumberIntType, &w),
++            CFNumberCreate(NULL, kCFNumberIntType, &h),
++        };
++        CFDictionaryRef par_dict = CFDictionaryCreate(NULL, keys, (const void **)vals, 2,
++                                                      &kCFTypeDictionaryKeyCallBacks,
++                                                      &kCFTypeDictionaryValueCallBacks);
++        CVBufferSetAttachment(pb, kCVImageBufferPixelAspectRatioKey, par_dict,
++                              kCVAttachmentMode_ShouldPropagate);
++        CFRelease(par_dict);
++        CFRelease(vals[0]);
++        CFRelease(vals[1]);
++    }
++}
++
++static void release_pool(struct priv *p)
++{
++    if (p->pool)
++        CVPixelBufferPoolRelease(p->pool);
++    p->pool = NULL;
++    p->pool_format = 0;
++}
++
++static bool ensure_pool(struct vo *vo, OSType fmt, int w, int h)
++{
++    struct priv *p = vo->priv;
++    if (p->pool && p->pool_format == fmt && p->pool_w == w && p->pool_h == h)
++        return true;
++    release_pool(p);
++
++    CFNumberRef cf_w = CFNumberCreate(NULL, kCFNumberIntType, &w);
++    CFNumberRef cf_h = CFNumberCreate(NULL, kCFNumberIntType, &h);
++    int fmt_i = (int)fmt;
++    CFNumberRef cf_fmt = CFNumberCreate(NULL, kCFNumberIntType, &fmt_i);
++    CFDictionaryRef iosurface = CFDictionaryCreate(NULL, NULL, NULL, 0,
++                                                   &kCFTypeDictionaryKeyCallBacks,
++                                                   &kCFTypeDictionaryValueCallBacks);
++    const void *keys[] = {
++        kCVPixelBufferWidthKey,
++        kCVPixelBufferHeightKey,
++        kCVPixelBufferPixelFormatTypeKey,
++        kCVPixelBufferIOSurfacePropertiesKey,
++    };
++    const void *vals[] = {cf_w, cf_h, cf_fmt, iosurface};
++    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, vals, 4,
++                                               &kCFTypeDictionaryKeyCallBacks,
++                                               &kCFTypeDictionaryValueCallBacks);
++    CVReturn r = CVPixelBufferPoolCreate(NULL, NULL, attrs, &p->pool);
++    CFRelease(attrs);
++    CFRelease(iosurface);
++    CFRelease(cf_fmt);
++    CFRelease(cf_h);
++    CFRelease(cf_w);
++    if (r != kCVReturnSuccess) {
++        MP_ERR(vo, "CVPixelBufferPoolCreate failed (%d)\n", (int)r);
++        p->pool = NULL;
++        return false;
++    }
++    p->pool_format = fmt;
++    p->pool_w = w;
++    p->pool_h = h;
++    return true;
++}
++
++// Copy a software mp_image into a fresh pooled CVPixelBuffer. Returns a +1
++// reference or NULL.
++static CVPixelBufferRef copy_to_pixelbuffer(struct vo *vo, struct mp_image *mpi)
++{
++    struct priv *p = vo->priv;
++    bool planar10;
++    OSType fmt = sw_pixel_format(p, mpi->imgfmt, &planar10);
++    if (!fmt)
++        return NULL;
++    if (!ensure_pool(vo, fmt, mpi->w, mpi->h))
++        return NULL;
++
++    CVPixelBufferRef pb = NULL;
++    CVReturn r = CVPixelBufferPoolCreatePixelBuffer(NULL, p->pool, &pb);
++    if (r != kCVReturnSuccess || !pb) {
++        MP_WARN(vo, "CVPixelBufferPoolCreatePixelBuffer failed (%d)\n", (int)r);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pb, 0);
++
++    int cw = mp_image_plane_w(mpi, 1), ch = mp_image_plane_h(mpi, 1);
++    bool planar = mpi->imgfmt == IMGFMT_420P || planar10;
++    int bytes = (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
++                 fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 1 : 2;
++
++    // Luma
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
++    size_t dst_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
++    for (int y = 0; y < mpi->h; y++) {
++        const uint8_t *src = mpi->planes[0] + (ptrdiff_t)y * mpi->stride[0];
++        uint8_t *dst = dst_y + y * dst_y_stride;
++        if (planar10) {
++            // yuv420p10: low 10 bits -> P010: high 10 bits.
++            const uint16_t *s = (const uint16_t *)src;
++            uint16_t *d = (uint16_t *)dst;
++            for (int x = 0; x < mpi->w; x++)
++                d[x] = (uint16_t)(s[x] << 6);
++        } else {
++            memcpy(dst, src, (size_t)mpi->w * bytes);
++        }
++    }
++
++    // Chroma (interleaved CbCr)
++    uint8_t *dst_c = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
++    size_t dst_c_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
++    for (int y = 0; y < ch; y++) {
++        uint8_t *dst = dst_c + y * dst_c_stride;
++        if (!planar) {
++            memcpy(dst, mpi->planes[1] + (ptrdiff_t)y * mpi->stride[1],
++                   (size_t)cw * 2 * bytes);
++        } else if (planar10) {
++            const uint16_t *u = (const uint16_t *)(mpi->planes[1] + (ptrdiff_t)y * mpi->stride[1]);
++            const uint16_t *v = (const uint16_t *)(mpi->planes[2] + (ptrdiff_t)y * mpi->stride[2]);
++            uint16_t *d = (uint16_t *)dst;
++            for (int x = 0; x < cw; x++) {
++                d[2 * x]     = (uint16_t)(u[x] << 6);
++                d[2 * x + 1] = (uint16_t)(v[x] << 6);
++            }
++        } else {
++            const uint8_t *u = mpi->planes[1] + (ptrdiff_t)y * mpi->stride[1];
++            const uint8_t *v = mpi->planes[2] + (ptrdiff_t)y * mpi->stride[2];
++            for (int x = 0; x < cw; x++) {
++                dst[2 * x]     = u[x];
++                dst[2 * x + 1] = v[x];
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++    return pb;
++}
++
++static void enqueue_pixelbuffer(struct vo *vo, CVPixelBufferRef pb)
++{
++    struct priv *p = vo->priv;
++
++    CMVideoFormatDescriptionRef desc = NULL;
++    OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &desc);
++    if (st != noErr || !desc) {
++        MP_WARN(vo, "CMVideoFormatDescriptionCreateForImageBuffer failed (%d)\n", (int)st);
++        return;
++    }
++
++    CMSampleTimingInfo timing = {
++        .duration = kCMTimeInvalid,
++        .presentationTimeStamp = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid,
++    };
++    CMSampleBufferRef sb = NULL;
++    st = CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, desc, &timing, &sb);
++    CFRelease(desc);
++    if (st != noErr || !sb) {
++        MP_WARN(vo, "CMSampleBufferCreateReadyWithImageBuffer failed (%d)\n", (int)st);
++        return;
++    }
++
++    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, true);
++    if (atts && CFArrayGetCount(atts) > 0) {
++        CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
++        CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
++    }
++
++    // AVSampleBufferDisplayLayer's enqueue is safe to call from any thread.
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
++        MP_WARN(vo, "display layer failed (%s), flushing\n",
++                layer.error.localizedDescription.UTF8String);
++        [layer flush];
++    }
++    if (layer.isReadyForMoreMediaData)
++        [layer enqueueSampleBuffer:sb];
++    else
++        MP_DBG(vo, "display layer not ready, dropping frame\n");
++
++    CFRelease(sb);
++}
++
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++
++    // Repeats (same frame again, e.g. display-resample) need no new enqueue:
++    // the layer keeps showing the last frame.
++    if (frame->repeat && !frame->redraw)
++        return VO_TRUE;
++    struct mp_image *mpi = frame->current;
++    if (!mpi)
++        return VO_TRUE;
++
++    CVPixelBufferRef pb = NULL;
++    if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++        pb = (CVPixelBufferRef)mpi->planes[3];
++        if (pb)
++            CVPixelBufferRetain(pb);
++    } else {
++        pb = copy_to_pixelbuffer(vo, mpi);
++        if (pb)
++            attach_colorimetry(p, pb);
++    }
++    if (!pb)
++        return VO_TRUE;
++
++    enqueue_pixelbuffer(vo, pb);
++    CVPixelBufferRelease(pb);
++    return VO_TRUE;
++}
++
++static void flip_page(struct vo *vo)
++{
++}
++
++static int query_format(struct vo *vo, int format)
++{
++    return format == IMGFMT_VIDEOTOOLBOX ||
++           format == IMGFMT_NV12 ||
++           format == IMGFMT_P010 ||
++           format == IMGFMT_420P ||
++           format == pixfmt2imgfmt(AV_PIX_FMT_YUV420P10);
++}
++
++static int reconfig(struct vo *vo, struct mp_image_params *params)
++{
++    struct priv *p = vo->priv;
++    p->params = *params;
++    // Format/size may have changed; the pool is recreated lazily.
++    release_pool(p);
++    return 0;
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
++    return VO_NOTIMPL;
++}
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    int64_t wid = vo->opts->WinID;
++    if (wid == 0 || wid == -1) {
++        MP_ERR(vo, "--wid must be set to an AVSampleBufferDisplayLayer pointer\n");
++        return -1;
++    }
++    id obj = (id)(intptr_t)wid;
++    if (![obj isKindOfClass:[AVSampleBufferDisplayLayer class]]) {
++        MP_ERR(vo, "--wid is not an AVSampleBufferDisplayLayer\n");
++        return -1;
++    }
++    p->layer = [(AVSampleBufferDisplayLayer *)obj retain];
++
++    // Register a VideoToolbox device so the decoder can output zero-copy
++    // IMGFMT_VIDEOTOOLBOX frames (normally done by the GPU hwdec interop).
++    vo->hwdec_devs = hwdec_devices_create();
++    p->hwctx = (struct mp_hwdec_ctx){
++        .driver_name = "avsamplebuffer",
++        .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
++    };
++    int ret = av_hwdevice_ctx_create(&p->hwctx.av_device_ref,
++                                     AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0);
++    if (ret < 0) {
++        MP_WARN(vo, "Failed to create VideoToolbox device; only software "
++                    "frames will be available.\n");
++    } else {
++        hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++        p->hwctx_added = true;
++    }
++    return 0;
++}
++
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->hwctx_added) {
++        hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
++        av_buffer_unref(&p->hwctx.av_device_ref);
++        p->hwctx_added = false;
++    }
++    if (p->layer) {
++        [p->layer flush];
++        [p->layer release];
++        p->layer = nil;
++    }
++    release_pool(p);
++}
++
++const struct vo_driver video_out_avsamplebuffer = {
++    .description = "AVSampleBufferDisplayLayer (Apple, hardware compositor)",
++    .name = "avsamplebuffer",
++    .preinit = preinit,
++    .query_format = query_format,
++    .reconfig = reconfig,
++    .control = control,
++    .draw_frame = draw_frame,
++    .flip_page = flip_page,
++    .uninit = uninit,
++    .priv_size = sizeof(struct priv),
++};
