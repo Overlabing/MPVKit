@@ -41,10 +41,10 @@ index c9cde30..c9fddc4 100644
  #endif
 diff --git a/video/out/vo_avsamplebuffer.m b/video/out/vo_avsamplebuffer.m
 new file mode 100644
-index 0000000..b6bd5f9
+index 0000000..1111111
 --- /dev/null
 +++ b/video/out/vo_avsamplebuffer.m
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,486 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -115,6 +115,11 @@ index 0000000..b6bd5f9
 +    CVPixelBufferPoolRef pool;
 +    OSType pool_format;
 +    int pool_w, pool_h;
++
++    // Prepared in draw_frame, presented in flip_page (mpv's present point).
++    CMSampleBufferRef pending;
++    // Format description cache, re-created only when the buffer format changes.
++    CMVideoFormatDescriptionRef fmtdesc;
 +};
 +
 +static OSType sw_pixel_format(struct priv *p, int imgfmt, bool *ten_bit_planar)
@@ -333,15 +338,22 @@ index 0000000..b6bd5f9
 +    return pb;
 +}
 +
-+static void enqueue_pixelbuffer(struct vo *vo, CVPixelBufferRef pb)
++// Build the CMSampleBuffer for pb and stash it; flip_page presents it.
++static void prepare_sample(struct vo *vo, CVPixelBufferRef pb)
 +{
 +    struct priv *p = vo->priv;
 +
-+    CMVideoFormatDescriptionRef desc = NULL;
-+    OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &desc);
-+    if (st != noErr || !desc) {
-+        MP_WARN(vo, "CMVideoFormatDescriptionCreateForImageBuffer failed (%d)\n", (int)st);
-+        return;
++    if (p->fmtdesc && !CMVideoFormatDescriptionMatchesImageBuffer(p->fmtdesc, pb)) {
++        CFRelease(p->fmtdesc);
++        p->fmtdesc = NULL;
++    }
++    if (!p->fmtdesc) {
++        OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &p->fmtdesc);
++        if (st != noErr || !p->fmtdesc) {
++            MP_WARN(vo, "CMVideoFormatDescriptionCreateForImageBuffer failed (%d)\n", (int)st);
++            p->fmtdesc = NULL;
++            return;
++        }
 +    }
 +
 +    CMSampleTimingInfo timing = {
@@ -350,8 +362,7 @@ index 0000000..b6bd5f9
 +        .decodeTimeStamp = kCMTimeInvalid,
 +    };
 +    CMSampleBufferRef sb = NULL;
-+    st = CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, desc, &timing, &sb);
-+    CFRelease(desc);
++    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, p->fmtdesc, &timing, &sb);
 +    if (st != noErr || !sb) {
 +        MP_WARN(vo, "CMSampleBufferCreateReadyWithImageBuffer failed (%d)\n", (int)st);
 +        return;
@@ -363,19 +374,9 @@ index 0000000..b6bd5f9
 +        CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
 +    }
 +
-+    // AVSampleBufferDisplayLayer's enqueue is safe to call from any thread.
-+    AVSampleBufferDisplayLayer *layer = p->layer;
-+    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-+        MP_WARN(vo, "display layer failed (%s), flushing\n",
-+                layer.error.localizedDescription.UTF8String);
-+        [layer flush];
-+    }
-+    if (layer.isReadyForMoreMediaData)
-+        [layer enqueueSampleBuffer:sb];
-+    else
-+        MP_DBG(vo, "display layer not ready, dropping frame\n");
-+
-+    CFRelease(sb);
++    if (p->pending)
++        CFRelease(p->pending);
++    p->pending = sb;
 +}
 +
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -403,13 +404,32 @@ index 0000000..b6bd5f9
 +    if (!pb)
 +        return VO_TRUE;
 +
-+    enqueue_pixelbuffer(vo, pb);
++    prepare_sample(vo, pb);
 +    CVPixelBufferRelease(pb);
 +    return VO_TRUE;
 +}
 +
++// mpv's present point: enqueue the frame prepared by draw_frame.
 +static void flip_page(struct vo *vo)
 +{
++    struct priv *p = vo->priv;
++    if (!p->pending)
++        return;
++
++    // AVSampleBufferDisplayLayer's enqueue is safe to call from any thread.
++    AVSampleBufferDisplayLayer *layer = p->layer;
++    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
++        MP_WARN(vo, "display layer failed (%s), flushing\n",
++                layer.error.localizedDescription.UTF8String);
++        [layer flush];
++    }
++    if (layer.isReadyForMoreMediaData)
++        [layer enqueueSampleBuffer:p->pending];
++    else
++        MP_DBG(vo, "display layer not ready, dropping frame\n");
++
++    CFRelease(p->pending);
++    p->pending = NULL;
 +}
 +
 +static int query_format(struct vo *vo, int format)
@@ -478,6 +498,18 @@ index 0000000..b6bd5f9
 +        hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
 +        av_buffer_unref(&p->hwctx.av_device_ref);
 +        p->hwctx_added = false;
++    }
++    if (vo->hwdec_devs) {
++        hwdec_devices_destroy(vo->hwdec_devs);
++        vo->hwdec_devs = NULL;
++    }
++    if (p->pending) {
++        CFRelease(p->pending);
++        p->pending = NULL;
++    }
++    if (p->fmtdesc) {
++        CFRelease(p->fmtdesc);
++        p->fmtdesc = NULL;
 +    }
 +    if (p->layer) {
 +        [p->layer flush];
