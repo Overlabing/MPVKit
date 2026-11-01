@@ -1,0 +1,36 @@
+name: Build tvOS (vo_avsamplebuffer)
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platforms (comma separated)'
+        default: 'tvos,tvsimulator'
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install autoconf automake libtool nasm meson ninja
+
+      - name: Build
+        run: |
+          make build platform=${{ github.event.inputs.platform }}
+
+      - name: Package artifacts
+        run: |
+          mkdir -p /tmp/out
+          find dist -name '*.xcframework.zip' -exec cp {} /tmp/out/ \; || true
+          find dist -name '*.xcframework.checksum.txt' -exec cp {} /tmp/out/ \; || true
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframeworks-tvos
+          path: /tmp/out/
+          retention-days: 7
