@@ -1,0 +1,368 @@
+diff --git a/meson.build b/meson.build
+index ca6cbd3..84d2c53 100644
+--- a/meson.build
++++ b/meson.build
+@@ -823,7 +823,7 @@ if features['avfoundation']
+     sources += files('audio/out/ao_avfoundation.m')
+ endif
+ 
+-avsamplebuffer_deps = dependency('appleframeworks', modules: ['CoreMedia', 'CoreVideo', 'AVFoundation'],
++avsamplebuffer_deps = dependency('appleframeworks', modules: ['CoreMedia', 'CoreVideo', 'CoreGraphics', 'QuartzCore', 'AVFoundation'],
+                                  required: false)
+ features += {'avsamplebuffer': features['avfoundation'] and avsamplebuffer_deps.found()}
+ if features['avsamplebuffer']
+diff --git a/video/out/vo_avsamplebuffer.m b/video/out/vo_avsamplebuffer.m
+index 836a45e..d5df6d8 100644
+--- a/video/out/vo_avsamplebuffer.m
++++ b/video/out/vo_avsamplebuffer.m
+@@ -30,9 +30,14 @@
+  *   - IMGFMT_NV12, IMGFMT_P010 (copied into a pooled CVPixelBuffer)
+  *   - IMGFMT_420P, YUV420P10 (converted to NV12 / P010 while copying)
+  *
+- * Not supported in this iteration (video only):
+- *   - OSD and subtitle rendering (nothing is drawn on top of the video; render
+- *     subtitles natively in the app, or keep using another vo for burned-in subs)
++ * OSD and subtitles are NOT drawn into the video buffers (that would break the
++ * zero-copy path). They are rendered with osd_render() + mp_draw_sub_overlay()
++ * into a premultiplied BGRA bitmap, wrapped in a CGImage and shown by a separate
++ * CALayer added as a sublayer of the display layer (sublayers are composited
++ * above the video). Only the bounding box of the non-transparent pixels is
++ * copied, and the image is only regenerated when the OSD content changed.
++ *
++ * Not supported in this iteration:
+  *   - HDR static/dynamic metadata (mastering display, content light level).
+  *     Only primaries / transfer / matrix attachments are set.
+  *   - video rotation (--video-rotate), flips, crop, panscan, filters needing GPU
+@@ -45,6 +50,8 @@
+ #include <AVFoundation/AVFoundation.h>
+ #include <CoreMedia/CoreMedia.h>
+ #include <CoreVideo/CoreVideo.h>
++#include <CoreGraphics/CoreGraphics.h>
++#include <QuartzCore/QuartzCore.h>
+ 
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_videotoolbox.h>
+@@ -52,6 +59,8 @@
+ 
+ #include "common/common.h"
+ #include "options/m_config.h"
++#include "sub/draw_bmp.h"
++#include "sub/osd.h"
+ #include "video/fmt-conversion.h"
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
+@@ -59,6 +68,130 @@
+ 
+ #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+ 
++// Main-thread-only helper owning the overlay CALayer that shows the OSD image.
++// Every method must be called on the main queue (the VO thread dispatches
++// asynchronously, never synchronously, so a main thread blocked on mpv cannot
++// deadlock). The overlay is positioned inside the aspect-fitted video rect of
++// the parent layer and follows parent bounds changes via KVO.
++@interface AVSBOverlay : NSObject {
++    AVSampleBufferDisplayLayer *_parent; // retained
++    CALayer *_layer;                     // retained
++    CGRect _rect;                        // image placement, in OSD pixels
++    CGSize _osdSize;                     // OSD resolution (video display size)
++    BOOL _hasImage;
++    BOOL _attached;
++    BOOL _detached;
++}
++- (instancetype)initWithParent:(AVSampleBufferDisplayLayer *)parent;
++- (void)attach;
++- (void)detach;
++// image == NULL clears the overlay.
++- (void)showImage:(CGImageRef)image rect:(CGRect)rect osdSize:(CGSize)size;
++@end
++
++@implementation AVSBOverlay
++
++- (instancetype)initWithParent:(AVSampleBufferDisplayLayer *)parent
++{
++    self = [super init];
++    if (self) {
++        _parent = [parent retain];
++        _layer = [[CALayer alloc] init];
++        _layer.contentsGravity = kCAGravityResize;
++        _layer.opaque = NO;
++        _layer.hidden = YES;
++        _layer.zPosition = 1;
++    }
++    return self;
++}
++
++- (void)dealloc
++{
++    [_layer release];
++    [_parent release];
++    [super dealloc];
++}
++
++- (void)attach
++{
++    if (_attached || _detached)
++        return;
++    [_parent addSublayer:_layer];
++    [_parent addObserver:self forKeyPath:@"bounds" options:0 context:NULL];
++    _attached = YES;
++}
++
++- (void)detach
++{
++    if (_detached)
++        return;
++    _detached = YES;
++    if (_attached) {
++        [_parent removeObserver:self forKeyPath:@"bounds"];
++        _attached = NO;
++    }
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    _layer.contents = nil;
++    [_layer removeFromSuperlayer];
++    [CATransaction commit];
++}
++
++// Must be called inside a CATransaction with actions disabled.
++- (void)relayout
++{
++    CGRect b = _parent.bounds;
++    if (!_hasImage || _osdSize.width <= 0 || _osdSize.height <= 0 ||
++        b.size.width <= 0 || b.size.height <= 0)
++    {
++        _layer.hidden = YES;
++        return;
++    }
++
++    // Map OSD pixels to layer points the same way the layer maps the video.
++    CGFloat sx = b.size.width / _osdSize.width;
++    CGFloat sy = b.size.height / _osdSize.height;
++    CGFloat ox = b.origin.x, oy = b.origin.y;
++    NSString *gravity = _parent.videoGravity;
++    if (![gravity isEqualToString:AVLayerVideoGravityResize]) {
++        CGFloat s = [gravity isEqualToString:AVLayerVideoGravityResizeAspectFill]
++                    ? MAX(sx, sy) : MIN(sx, sy);
++        ox += (b.size.width - _osdSize.width * s) / 2;
++        oy += (b.size.height - _osdSize.height * s) / 2;
++        sx = sy = s;
++    }
++    _layer.frame = CGRectMake(ox + _rect.origin.x * sx, oy + _rect.origin.y * sy,
++                              _rect.size.width * sx, _rect.size.height * sy);
++    _layer.hidden = NO;
++}
++
++- (void)showImage:(CGImageRef)image rect:(CGRect)rect osdSize:(CGSize)size
++{
++    if (_detached)
++        return;
++    _hasImage = image != NULL;
++    _rect = rect;
++    _osdSize = size;
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    _layer.contents = image ? (id)image : nil;
++    [self relayout];
++    [CATransaction commit];
++}
++
++- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
++                        change:(NSDictionary *)change context:(void *)context
++{
++    if (_detached || !_hasImage)
++        return;
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    [self relayout];
++    [CATransaction commit];
++}
++
++@end
++
+ struct priv {
+     AVSampleBufferDisplayLayer *layer; // retained
+     struct mp_hwdec_ctx hwctx;
+@@ -73,6 +206,12 @@ struct priv {
+     CMSampleBufferRef pending;
+     // Format description cache, re-created only when the buffer format changes.
+     CMVideoFormatDescriptionRef fmtdesc;
++
++    // OSD / subtitles overlay (see draw_osd).
++    AVSBOverlay *overlay;               // retained
++    struct mp_draw_sub_cache *osd_cache;
++    int osd_w, osd_h;                   // OSD resolution of the shown image, 0 = unknown
++    bool osd_visible;                   // overlay currently shows an image
+ };
+ 
+ static OSType sw_pixel_format(struct priv *p, int imgfmt, bool *ten_bit_planar)
+@@ -332,15 +471,131 @@ static void prepare_sample(struct vo *vo, CVPixelBufferRef pb)
+     p->pending = sb;
+ }
+ 
++static void free_overlay_pixels(void *info, const void *data, size_t size)
++{
++    free((void *)data);
++}
++
++// Copy rc out of the (cache-owned, premultiplied BGRA) overlay into a new
++// CGImage (+1 reference), or NULL on failure.
++static CGImageRef make_overlay_image(struct mp_image *osd, struct mp_rect rc)
++{
++    int w = mp_rect_w(rc), h = mp_rect_h(rc);
++    if (w <= 0 || h <= 0)
++        return NULL;
++    size_t stride = (size_t)w * 4;
++    void *buf = malloc(stride * h);
++    if (!buf)
++        return NULL;
++    memcpy_pic(buf, mp_image_pixel_ptr(osd, 0, rc.x0, rc.y0), w * 4, h,
++               (int)stride, osd->stride[0]);
++
++    CGDataProviderRef prov =
++        CGDataProviderCreateWithData(NULL, buf, stride * h, free_overlay_pixels);
++    if (!prov) {
++        free(buf);
++        return NULL;
++    }
++    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++    CGImageRef img = CGImageCreate(w, h, 8, 32, stride, cs,
++                                   kCGBitmapByteOrder32Little |
++                                   kCGImageAlphaPremultipliedFirst,
++                                   prov, NULL, false, kCGRenderingIntentDefault);
++    if (cs)
++        CGColorSpaceRelease(cs);
++    CGDataProviderRelease(prov);
++    return img;
++}
++
++// Hand an overlay image (or NULL to clear) to the main thread. Consumes the
++// caller's reference on image.
++static void push_overlay(struct priv *p, CGImageRef image, CGRect rect, CGSize size)
++{
++    AVSBOverlay *ov = p->overlay; // retained by the block
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [ov showImage:image rect:rect osdSize:size];
++        if (image)
++            CGImageRelease(image);
++    });
++}
++
++// Render OSD + subtitles for the frame with the given pts and update the
++// overlay layer if (and only if) something changed.
++static void draw_osd(struct vo *vo, double pts)
++{
++    struct priv *p = vo->priv;
++    if (!p->overlay || !vo->params || vo->dwidth <= 0 || vo->dheight <= 0)
++        return;
++
++    // The layer shows the video aspect-fitted in its bounds; render the OSD at
++    // the video display size without borders and let the overlay be scaled the
++    // same way.
++    struct mp_osd_res res = {
++        .w = vo->dwidth,
++        .h = vo->dheight,
++        .display_par = vo->monitor_par,
++    };
++
++    if (!p->osd_cache)
++        p->osd_cache = mp_draw_sub_alloc(p, vo->global);
++
++    struct sub_bitmap_list *sbs = osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
++
++    struct mp_rect act_rc[1], mod_rc[64];
++    int num_act = 0, num_mod = 0;
++    struct mp_image *osd = mp_draw_sub_overlay(p->osd_cache, sbs,
++                                               act_rc, MP_ARRAY_SIZE(act_rc), &num_act,
++                                               mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod);
++    if (!osd) {
++        MP_WARN(vo, "Failed rendering OSD.\n");
++        goto done;
++    }
++
++    // num_mod == 0 guarantees the active region is unchanged. A resolution
++    // change must be pushed regardless (placement depends on it, and a new,
++    // empty overlay would otherwise not report the old one as modified).
++    bool res_changed = p->osd_w != res.w || p->osd_h != res.h;
++    if (!num_mod && !res_changed)
++        goto done;
++    p->osd_w = res.w;
++    p->osd_h = res.h;
++
++    CGSize size = CGSizeMake(res.w, res.h);
++    if (num_act > 0) {
++        struct mp_rect rc = act_rc[0];
++        CGImageRef img = make_overlay_image(osd, rc);
++        if (img) {
++            push_overlay(p, img, CGRectMake(rc.x0, rc.y0, mp_rect_w(rc), mp_rect_h(rc)), size);
++            p->osd_visible = true;
++            goto done;
++        }
++        MP_WARN(vo, "Failed to create OSD image.\n");
++    }
++    // Nothing to draw (or image creation failed): clear once.
++    if (p->osd_visible) {
++        push_overlay(p, NULL, CGRectZero, size);
++        p->osd_visible = false;
++    }
++
++done:
++    talloc_free(sbs);
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+ 
++    struct mp_image *mpi = frame->current;
++
++    // Subtitles/OSD follow the displayed frame's pts (frame->current), also on
++    // repeats and redraws (e.g. a subtitle change while paused). This is cheap
++    // when nothing changed.
++    draw_osd(vo, mpi ? mpi->pts : MP_NOPTS_VALUE);
++
+     // Repeats (same frame again, e.g. display-resample) need no new enqueue:
+     // the layer keeps showing the last frame.
+     if (frame->repeat && !frame->redraw)
+         return VO_TRUE;
+-    struct mp_image *mpi = frame->current;
+     if (!mpi)
+         return VO_TRUE;
+ 
+@@ -400,6 +655,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
+     p->params = *params;
+     // Format/size may have changed; the pool is recreated lazily.
+     release_pool(p);
++    // The OSD resolution follows the video display size: re-place the overlay.
++    p->osd_w = p->osd_h = 0;
+     return 0;
+ }
+ 
+@@ -424,6 +681,11 @@ static int preinit(struct vo *vo)
+     }
+     p->layer = [(AVSampleBufferDisplayLayer *)obj retain];
+ 
++    // OSD overlay: created here, attached to the layer on the main thread.
++    p->overlay = [[AVSBOverlay alloc] initWithParent:p->layer];
++    AVSBOverlay *ov = p->overlay;
++    dispatch_async(dispatch_get_main_queue(), ^{ [ov attach]; });
++
+     // Register a VideoToolbox device so the decoder can output zero-copy
+     // IMGFMT_VIDEOTOOLBOX frames (normally done by the GPU hwdec interop).
+     vo->hwdec_devs = hwdec_devices_create();
+@@ -464,6 +726,16 @@ static void uninit(struct vo *vo)
+         CFRelease(p->fmtdesc);
+         p->fmtdesc = NULL;
+     }
++    if (p->overlay) {
++        // Detach on the main thread; the block keeps the overlay alive until
++        // then. Asynchronous on purpose: the main thread may be waiting on us.
++        AVSBOverlay *ov = p->overlay;
++        p->overlay = nil;
++        dispatch_async(dispatch_get_main_queue(), ^{ [ov detach]; });
++        [ov release];
++    }
++    talloc_free(p->osd_cache);
++    p->osd_cache = NULL;
+     if (p->layer) {
+         [p->layer flush];
+         [p->layer release];
